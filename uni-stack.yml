@@ -1,0 +1,1298 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'AWS CloudFormation stack: running Unifi Controller in a Docker container.'
+Parameters:
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: VpcId of your existing Virtual Private Cloud (VPC)
+    ConstraintDescription: must be the VPC Id of an existing Virtual Private Cloud.
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: The list of SubnetIds in your Virtual Private Cloud (VPC)
+    ConstraintDescription: >-
+      must be a list of at least two existing subnets associated with at least
+      two different availability zones. They should be residing in the selected
+      Virtual Private Cloud.
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  InstanceCapacity:
+    Default: '1'
+    Description: The initial nuber of instances
+    Type: Number
+    MinValue: '1'
+    MaxValue: '1'
+    ConstraintDescription: must be between 1 and 5 EC2 instances.
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+    ConstraintDescription: must be a valid EC2 instance type.
+  SSHLocation:
+    Description: ' The IP address range that can be used to SSH to the EC2 instances'
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  DomainName:
+    AllowedPattern: >-
+      (?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])
+    Type: String
+    ConstraintDescription: Must be a valid domain name
+    Description: Domain name for SSL certificate
+  DomainOwnerEmail:
+    AllowedPattern: >-
+      (?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])
+    Type: String
+    ConstraintDescription: Must be a valid email address
+    Description: Domain owner's email address
+  MountPoint:
+    Description: The Linux mount point for the EFS volume
+    Type: String
+    MinLength: '1'
+    Default: EFSvolume
+Mappings:
+  AWSInstanceType2Arch:
+    t2.micro:
+      Arch: HVM64
+  AWSRegionArch2AMI:
+    us-east-1:
+      HVM64: ami-6057e21a
+    eu-central-1:
+      HVM64: ami-ea26ce85
+  AWSRegion2AZ:
+    us-east-1:
+      Name: N. Virgina
+      NumAZs: '6'
+    eu-central-1:
+      Name: Frankfurt
+      NumAZs: '2'
+Resources:
+  ServerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: cdd10e83-a6d9-4e28-8012-652a64327684
+  AssociateElasticIPPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: AssociateElasticIP
+      PolicyDocument:
+        Statement:
+          Effect: Allow
+          Action:
+            - 'ec2:AssociateAddress'
+            - 'ec2:Describe*'
+          Resource:
+            - '*'
+      Roles:
+        - Ref: ServerRole
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e522ee2e-cda6-422d-a532-5ab84d4c6ddf
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - Ref: ServerRole
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 04454b33-5e77-4507-983c-6b7d5318835d
+  AutoscalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchConfigurationName: !Ref LaunchConfig
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: !Ref InstanceCapacity
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '0'
+        MaxBatchSize: '1'
+        PauseTime: PT9M
+        WaitOnResourceSignals: 'true'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT9M
+        Count: !Ref InstanceCapacity
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 063732de-913f-4f73-8ecc-1649128ae9ec
+  LaunchConfig:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: '8'
+            VolumeType: gp2
+            DeleteOnTermination: 'true'
+      ImageId: !FindInMap 
+        - AWSRegionArch2AMI
+        - !Ref 'AWS::Region'
+        - !FindInMap 
+          - AWSInstanceType2Arch
+          - !Ref InstanceType
+          - Arch
+      InstanceMonitoring: 'false'
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref SSHAccessSG
+        - !Ref LetsencryptServerSG
+        - !Ref UnifiControllerSG
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      KeyName: !Ref KeyName
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash -xe
+            - |
+              yum update -y aws-cfn-bootstrap
+            - '/opt/aws/bin/cfn-init -v '
+            - '         --stack '
+            - !Ref 'AWS::StackId'
+            - '         --resource LaunchConfig '
+            - '         --configsets="full_install,MountConfig" '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - '/opt/aws/bin/cfn-signal -e $? '
+            - '         --stack '
+            - !Ref 'AWS::StackId'
+            - '         --resource AutoscalingGroup '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+    DependsOn:
+      - FileSystemGP
+      - FileSystemMaxIO
+      - MountTargetGP1
+      - MountTargetGP2
+      - MountTargetMaxIO1
+      - MountTargetMaxIO2
+      - ElasticIP
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          full_install:
+            - install_cfn
+            - associate_eip
+            - install_docker
+            - setup_docker_cloudstor
+            - setup_unifi_stack
+            - regular_yum_update
+          MountConfig:
+            - mount
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [main]
+                  - stack=
+                  - !Ref 'AWS::StackId'
+                  - |+
+
+                  - region=
+                  - !Ref 'AWS::Region'
+                  - |+
+
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [cfn-auto-reloader-hook]
+                  - |
+                    triggers=post.update
+                  - >
+                    path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+                  - 'action=/opt/aws/bin/cfn-init -v '
+                  - '         --stack '
+                  - !Ref 'AWS::StackName'
+                  - '         --resource LaunchConfig '
+                  - '         --configsets full_install '
+                  - '         --region '
+                  - !Ref 'AWS::Region'
+                  - |+
+
+                  - |
+                    runas=root
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        associate_eip:
+          packages:
+            python:
+              aws-ec2-assign-elastic-ip: []
+          commands:
+            01_aws-ec2-assign-elastic-ip:
+              command: !Sub |
+                /usr/local/bin/aws-ec2-assign-elastic-ip --region ${AWS::Region}
+        install_docker:
+          packages:
+            yum:
+              docker: []
+          commands:
+            01_add_ec2-user_to_docker_group:
+              command: usermod -a -G docker ec2-user
+          services:
+            sysvinit:
+              docker:
+                enabled: 'true'
+                ensureRunning: 'true'
+                packages:
+                  yum:
+                    - docker
+        setup_docker_cloudstor:
+          commands:
+            01_install_docker_cloudstor:
+              command: !Sub >
+                sudo -u ec2-user docker plugin install --alias cloudstor:aws
+                --grant-all-permissions docker4x/cloudstor:latest
+                CLOUD_PLATFORM=AWS EFS_ID_REGULAR=${FileSystemGP}
+                EFS_ID_MAXIO=${FileSystemMaxIO} DEBUG=1
+        setup_unifi_stack:
+          files:
+            /home/ec2-user/docker-cloud.yml:
+              content: !Join 
+                - ''
+                - - |
+                    version: "3.3"
+                  - |
+                    services:
+                  - |2
+                      controller:
+                  - |2
+                        deploy:
+                  - |2
+                          replicas: 1
+                  - |2
+                          restart_policy:
+                  - |2
+                            condition: any
+                  - |2
+                        image: jacobalberty/unifi:latest
+                  - |2
+                        environment:
+                  - |2
+                          - TZ=UTC
+                  - |2
+                        ports:
+                  - |2
+                          - "8080:8080"
+                  - |2
+                          - "8443:8443"
+                  - |2
+                          - "8843:8843"
+                  - |2
+                          - "8880:8880"
+                  - |2
+                          - "6789:6789"
+                  - |2
+                          - "3478:3478/udp"
+                  - |2
+                          - "10001:10001/udp"
+                  - |2
+                        volumes:
+                  - |2
+                          - type: bind
+                  - |2
+                            source: /unifi/cert
+                  - |2
+                            target: /unifi/cert
+                  - |2
+                          - type: volume
+                  - |2
+                            source: data
+                  - |2
+                            target: /unifi/data
+                  - |2
+                          - type: volume
+                  - |2
+                            source: log
+                  - |2
+                            target: /unifi/log
+                  - |2
+                          - type: volume
+                  - |2
+                            source: init.d
+                  - |2
+                            target: /unifi/init.d
+                  - |+
+
+                  - |2
+                      certbot:
+                  - '    command: certonly --standalone --noninteractive --agree-tos --email '
+                  - !Ref DomainOwnerEmail
+                  - ' -d '
+                  - !Ref DomainName
+                  - |2
+                     --deploy-hook 'cp "$${RENEWED_LINEAGE}/"*.pem /unifi/cert'
+                  - |2
+                        deploy:
+                  - |2
+                          replicas: 1
+                  - |2
+                          restart_policy:
+                  - |2
+                            condition: any
+                  - |2
+                            delay: 24h
+                  - |2
+                        image: certbot/certbot:latest
+                  - |2
+                        ports:
+                  - |2
+                          - "80:80"
+                  - |2
+                          - "443:443"
+                  - |2
+                        volumes:
+                  - |2
+                          - type: volume
+                  - |2
+                            source: letsencrypt
+                  - |2
+                            target: /etc/letsencrypt
+                  - |2
+                          - type: bind
+                  - |2
+                            source: /unifi/cert
+                  - |2
+                            target: /unifi/cert
+                  - |+
+
+                  - |
+                    volumes:
+                  - |2
+                      letsencrypt:
+                  - |2
+                        driver: "cloudstor:aws"
+                  - |2
+                      data:
+                  - |2
+                        driver: "cloudstor:aws"
+                  - |2
+                      log:
+                  - |2
+                        driver: "cloudstor:aws"
+                  - |2
+                      init.d:
+                  - |2
+                        driver: "cloudstor:aws"
+              mode: '000644'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/unifi-cert-update.sh:
+              content: !Join 
+                - |+
+
+                - - '#!/bin/sh'
+                  - ''
+                  - 'log() {'
+                  - '    echo "$(date) $*" >> /unifi/cert/unifi-cert-update.log'
+                  - '}'
+                  - ''
+                  - >-
+                    if $(md5sum -c "/unifi/cert/cert.pem.md5" &> /dev/null);
+                    then
+                  - '    log "no changes"'
+                  - '    exit 0'
+                  - fi
+                  - ''
+                  - log "restarting..."
+                  - |
+                    docker service update --force unifi_controller &> /dev/null
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+          commands:
+            01_create_unifi_cert_dir:
+              command: 'mkdir -p /unifi/cert && chown -R ec2-user:ec2-user /unifi/cert'
+            02_init_docker_swarm:
+              command: sudo -u ec2-user docker swarm init
+            03_deploy_unifi_stack:
+              command: >-
+                sudo -u ec2-user docker stack deploy -c
+                /home/ec2-user/docker-cloud.yml unifi
+            04_setup_cert_update:
+              command: >-
+                (crontab -u ec2-user -l 2> /dev/null; echo "11 11 * * *
+                ~/unifi-cert-update.sh") | crontab -u ec2-user -
+            05_update_unifi_stack:
+              command: sudo -u ec2-user "/home/ec2-user/unifi-cert-update.sh"
+        regular_yum_update:
+          commands:
+            01_yum_update_cronjob:
+              command: >-
+                (crontab -l 2> /dev/null; echo "22 03 * * * yum update -y &>
+                /dev/null") | crontab -
+        mount:
+          commands:
+            01_create_nfs_dir:
+              command: !Sub 'mkdir /${MountPoint}'
+            02_mount_nfs_dir:
+              command: !Sub >
+                mount -t nfs4 -o nfsvers=4.1
+                ${FileSystemGP}.efs.${AWS::Region}.amazonaws.com:/
+                /${MountPoint}
+            03_permissions:
+              command: !Sub 'chown ec2-user:ec2-user /${MountPoint}'
+      'AWS::CloudFormation::Designer':
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+  SSHAccessSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref SSHLocation
+      VpcId: !Ref VpcId
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 9c8e4509-13a2-400a-9236-e1ad6e5fb740
+  LetsencryptServerSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP and HTTPS access for updating Letsencrypt SSL certificates
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VpcId
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: b724709e-5442-48a5-9aa8-3180d6c8992c
+  MountTargetSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Security group for mount target
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          SourceSecurityGroupId: !Ref UnifiControllerSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 89fb7e77-f3b4-4733-adc6-57399467a258
+  UnifiControllerSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Unifi Controller inbound access rules
+      SecurityGroupIngress:
+        - FromPort: 3478
+          Description: UDP port used for STUN. v4.5.2+
+          CidrIp: 0.0.0.0/0
+          ToPort: 3478
+          IpProtocol: udp
+        - FromPort: 10001
+          Description: for AP discovery
+          CidrIp: 0.0.0.0/0
+          ToPort: 10001
+          IpProtocol: udp
+        - FromPort: 8080
+          Description: TCP port for UAP to inform controller
+          CidrIp: 0.0.0.0/0
+          ToPort: 8080
+          IpProtocol: tcp
+        - FromPort: 8843
+          Description: TCP port for HTTPS portal redirect
+          CidrIp: 0.0.0.0/0
+          ToPort: 8843
+          IpProtocol: tcp
+        - FromPort: 8443
+          Description: 'TCP port for controller GUI / API, as seen in web browser'
+          CidrIp: 0.0.0.0/0
+          ToPort: 8443
+          IpProtocol: tcp
+        - FromPort: 6789
+          Description: >-
+            TCP port used for throughput measurement, including UniFi mobile
+            speedtest
+          CidrIp: 0.0.0.0/0
+          ToPort: 6789
+          IpProtocol: tcp
+        - FromPort: 8880
+          Description: TCP port for HTTP portal redirect
+          CidrIp: 0.0.0.0/0
+          ToPort: 8880
+          IpProtocol: tcp
+      VpcId: !Ref VpcId
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+  FileSystemGP:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      FileSystemTags:
+        - Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - EFS-GP
+          Key: Name
+      PerformanceMode: generalPurpose
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+  FileSystemMaxIO:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      FileSystemTags:
+        - Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - EFS-MaxIO
+          Key: Name
+      PerformanceMode: maxIO
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+  MountTargetGP1:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '0'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e172121c-643a-4cba-9319-34557a0b899c
+    DependsOn:
+      - FileSystemGP
+  MountTargetGP2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '1'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+    DependsOn:
+      - FileSystemGP
+  MountTargetGP3:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '2'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemGP
+  MountTargetGP4:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '3'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemGP
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f32be108-70b2-4c0a-8f23-d1485e647670
+  MountTargetGP5:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '4'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemGP
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2b04ab2f-f06c-4c6c-9dce-d37623acd4fe
+  MountTargetGP6:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemGP
+      SubnetId: !Select 
+        - '5'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemGP
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 80341dd3-6aa4-48e8-8fc3-5434f58c51bd
+  MountTargetMaxIO1:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '0'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+    DependsOn:
+      - FileSystemMaxIO
+  MountTargetMaxIO2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '1'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: c832e648-36cf-42b0-a3b6-b409031b224c
+    DependsOn:
+      - FileSystemMaxIO
+  MountTargetMaxIO3:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '2'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 30565d7c-d3d3-44dc-8a19-e81ea9afbd0a
+    DependsOn:
+      - FileSystemMaxIO
+  MountTargetMaxIO4:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '3'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemMaxIO
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 9b8ec6a5-fc8e-41e1-a5c1-17a5bcee8826
+  MountTargetMaxIO5:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '4'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemMaxIO
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e6cc945a-248b-4145-86b2-90f73b7b36df
+  MountTargetMaxIO6:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystemMaxIO
+      SubnetId: !Select 
+        - '5'
+        - !Ref Subnets
+      SecurityGroups:
+        - !Ref MountTargetSG
+    Condition: UseUpTo6Subnets
+    DependsOn:
+      - FileSystemMaxIO
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 96a47eef-031d-45c6-a428-474e1cf87b5a
+  ElasticIP:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: vpc
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2dbf734d-338d-4c36-97c9-ed668f141ea1
+Outputs:
+  WebsiteURL:
+    Value: !Sub 'http://${DomainName}:8080'
+    Description: URL for newly created Unifi Controller
+Metadata:
+  'AWS::CloudFormation::Designer':
+    b724709e-5442-48a5-9aa8-3180d6c8992c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -310
+        'y': 290
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 55f4898d-0c78-452e-8404-db78f4aac61b
+    e2bce8b5-ceb7-425a-9679-3b90d9396bce:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -200
+        'y': 290
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - b724709e-5442-48a5-9aa8-3180d6c8992c
+        - 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+        - 9c8e4509-13a2-400a-9236-e1ad6e5fb740
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - e172121c-643a-4cba-9319-34557a0b899c
+        - da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+        - 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+        - c832e648-36cf-42b0-a3b6-b409031b224c
+        - 2dbf734d-338d-4c36-97c9-ed668f141ea1
+      isrelatedto:
+        - 04454b33-5e77-4507-983c-6b7d5318835d
+    098043b9-a6b4-434e-a25c-1fbc7db6a801:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -90
+        'y': 230
+      z: 2
+      parent: cbe16155-bb00-4692-b07b-ee67f2080884
+      embeds: []
+      isassociatedwith:
+        - e2bce8b5-ceb7-425a-9679-3b90d9396bce
+      dependson:
+        - e172121c-643a-4cba-9319-34557a0b899c
+        - da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+        - 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+        - 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+        - c832e648-36cf-42b0-a3b6-b409031b224c
+        - 30565d7c-d3d3-44dc-8a19-e81ea9afbd0a
+    1f1eeaa2-8eeb-494c-8459-039aac3fbe7d:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -310
+        'y': 400
+      z: 1
+      embeds: []
+    a1ba698d-0f51-40ca-bd8d-407df5cabe89:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+        selector: 'g:nth-child(1) g:nth-child(4) g:nth-child(2) circle:nth-child(1)     '
+        port: 'AWS::RefLink-AWS::EC2::SecurityGroup-SecurityGroups'
+      target:
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+      z: 3
+    8f7e2c77-ab3b-4ea9-a0f9-1d2ee2ec163a:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+        selector: 'g:nth-child(1) g:nth-child(4) g:nth-child(2) circle:nth-child(1)     '
+        port: 'AWS::RefLink-AWS::EC2::SecurityGroup-SecurityGroups'
+      target:
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+      z: 3
+    df354104-1728-4b17-8a02-7d12c1d21d60:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+        selector: 'g:nth-child(1) g:nth-child(4) g:nth-child(2) circle:nth-child(1)     '
+        port: 'AWS::RefLink-AWS::EC2::SecurityGroup-SecurityGroups'
+      target:
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+      z: 3
+    566afc41-443a-467f-98b2-32da275a821c:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+        selector: 'g:nth-child(1) g:nth-child(4) g:nth-child(2) circle:nth-child(1)     '
+        port: 'AWS::RefLink-AWS::EC2::SecurityGroup-SecurityGroups'
+      target:
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+      z: 3
+    ade4cf0d-a11a-41c7-abd1-315550c23de4:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+        selector: 'g:nth-child(1) g:nth-child(4) g:nth-child(2) circle:nth-child(1)     '
+        port: 'AWS::RefLink-AWS::EC2::SecurityGroup-SecurityGroups'
+      target:
+        id: 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+      z: 3
+    6e815a40-09c4-446c-93c6-ae0d52714602:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 270
+        'y': 330
+      z: 1
+      embeds: []
+    def6c2e7-c7b3-48e4-842d-72557f892442:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -90
+        'y': 290
+      z: 1
+      embeds: []
+    113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -90
+        'y': 190
+      z: 1
+      embeds: []
+    f0e89c0e-62d2-405b-8d98-2378c4d25292:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 2
+    f3949ff7-97d2-45e3-88f6-07e7127c6e92:
+      source:
+        id: e2bce8b5-ceb7-425a-9679-3b90d9396bce
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 3
+    e172121c-643a-4cba-9319-34557a0b899c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 10
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    da41e34e-83d2-43ef-9e61-7d3b1cd3a439:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    31ccf7e7-2658-4563-afaf-c8a36744bcd1:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 210
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    2306436c-bcc6-4314-8ec7-8d192df75681:
+      source:
+        id: e172121c-643a-4cba-9319-34557a0b899c
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 2
+    5c530fcf-2f4d-4136-bc23-36be079e7d24:
+      source:
+        id: da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 3
+    239ac9b7-dfd2-422b-813e-63590608a630:
+      source:
+        id: 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 4
+    30565d7c-d3d3-44dc-8a19-e81ea9afbd0a:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 210
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    c832e648-36cf-42b0-a3b6-b409031b224c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    940cf6f9-deab-4cbd-95cb-28ce9451d9c4:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 10
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    91fe400d-8ad8-400b-9a54-48895c03b991:
+      source:
+        id: da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 2
+    925e08fb-182e-4728-b783-522f3752fcbe:
+      source:
+        id: e172121c-643a-4cba-9319-34557a0b899c
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 3
+    d154826c-eef0-4f4e-a585-ff2099bb748d:
+      source:
+        id: 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 4
+    4b5ddefd-9a26-4705-b581-5a955bb5dcd7:
+      source:
+        id: 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 5
+    7d528343-0773-488c-8e01-6b59bdaf946b:
+      source:
+        id: c832e648-36cf-42b0-a3b6-b409031b224c
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 6
+    725ad795-156e-4e23-9378-c4ba9ae8eaf9:
+      source:
+        id: 30565d7c-d3d3-44dc-8a19-e81ea9afbd0a
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 7
+    e8a05c50-999e-4086-af95-74cbc684c8d6:
+      source:
+        id: e172121c-643a-4cba-9319-34557a0b899c
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 8
+    92bed4ed-87ea-4247-ba5b-9cb97276ed01:
+      source:
+        id: da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 9
+    a0d2c4ef-018a-488e-9c00-e69c1fba2ea3:
+      source:
+        id: 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+      target:
+        id: 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      z: 10
+    a3516b6b-2e5c-41de-b060-dc8cdbcf6bfd:
+      source:
+        id: 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 11
+    d9ccb0e8-91d4-45fa-b29a-614388c26317:
+      source:
+        id: c832e648-36cf-42b0-a3b6-b409031b224c
+      target:
+        id: def6c2e7-c7b3-48e4-842d-72557f892442
+      z: 12
+    96a47eef-031d-45c6-a428-474e1cf87b5a:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 510
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    e6cc945a-248b-4145-86b2-90f73b7b36df:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 410
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    9b8ec6a5-fc8e-41e1-a5c1-17a5bcee8826:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 310
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+      dependson:
+        - def6c2e7-c7b3-48e4-842d-72557f892442
+    80341dd3-6aa4-48e8-8fc3-5434f58c51bd:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 510
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    2b04ab2f-f06c-4c6c-9dce-d37623acd4fe:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 410
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    f32be108-70b2-4c0a-8f23-d1485e647670:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 310
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89fb7e77-f3b4-4733-adc6-57399467a258
+      references:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+      dependson:
+        - 113fc0d7-0be9-4b77-afe5-d0f4fec2bfc2
+    89fb7e77-f3b4-4733-adc6-57399467a258:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 560
+        'y': 230
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 1f1eeaa2-8eeb-494c-8459-039aac3fbe7d
+    9c8e4509-13a2-400a-9236-e1ad6e5fb740:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -310
+        'y': 190
+      z: 1
+      embeds: []
+    cdd10e83-a6d9-4e28-8012-652a64327684:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -200
+        'y': 90
+      z: 1
+      embeds: []
+    04454b33-5e77-4507-983c-6b7d5318835d:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -200
+        'y': 190
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - cdd10e83-a6d9-4e28-8012-652a64327684
+    cbe16155-bb00-4692-b07b-ee67f2080884:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 60
+        'y': 330
+      z: 1
+      embeds:
+        - 098043b9-a6b4-434e-a25c-1fbc7db6a801
+      isassociatedwith:
+        - cdd10e83-a6d9-4e28-8012-652a64327684
+    e522ee2e-cda6-422d-a532-5ab84d4c6ddf:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -310
+        'y': 90
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - cdd10e83-a6d9-4e28-8012-652a64327684
+    208acc54-eb85-4e77-8ea0-bab62c10d305:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -80
+        'y': 490
+      z: 2
+      parent: cbe16155-bb00-4692-b07b-ee67f2080884
+      embeds: []
+      isassociatedwith:
+        - e2bce8b5-ceb7-425a-9679-3b90d9396bce
+      dependson:
+        - e172121c-643a-4cba-9319-34557a0b899c
+        - da41e34e-83d2-43ef-9e61-7d3b1cd3a439
+        - 31ccf7e7-2658-4563-afaf-c8a36744bcd1
+        - 940cf6f9-deab-4cbd-95cb-28ce9451d9c4
+        - c832e648-36cf-42b0-a3b6-b409031b224c
+        - 30565d7c-d3d3-44dc-8a19-e81ea9afbd0a
+    063732de-913f-4f73-8ecc-1649128ae9ec:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -200
+        'y': 400
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - e2bce8b5-ceb7-425a-9679-3b90d9396bce
+    2dbf734d-338d-4c36-97c9-ed668f141ea1:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: -90
+        'y': 400
+      z: 0
+      embeds: []
+Conditions:
+  UseUpTo6Subnets: !Equals 
+    - !Ref 'AWS::Region'
+    - us-east-1

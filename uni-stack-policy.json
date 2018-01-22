@@ -1,0 +1,21 @@
+{
+  "Statement" : [
+    {
+      "Effect" : "Deny",
+      "Action" : ["Update:Replace", "Update:Delete"],
+      "Principal": "*",
+      "Resource" : "LogicalResourceId/ElasticIP",
+      "Condition" : {
+        "StringEquals" : {
+          "ResourceType" : ["AWS::EC2::EIP"]
+        }
+      }
+    },
+    {
+      "Effect" : "Allow",
+      "Action" : "Update:*",
+      "Principal": "*",
+      "Resource" : "*"
+    }
+  ]
+}

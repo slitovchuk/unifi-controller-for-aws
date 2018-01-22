@@ -1,0 +1,60 @@
+version: "3.3"
+services:
+  controller:
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+    image: jacobalberty/unifi:latest
+    environment:
+      - TZ=UTC
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "8843:8843"
+      - "8880:8880"
+      - "6789:6789"
+      - "3478:3478/udp"
+      - "10001:10001/udp"
+    volumes:
+      - type: bind
+        source: /unifi/cert
+        target: /unifi/cert
+      - type: volume
+        source: data
+        target: /unifi/data
+      - type: volume
+        source: log
+        target: /unifi/log
+      - type: volume
+        source: init.d
+        target: /unifi/init.d
+
+  certbot:
+    command: certonly --standalone --noninteractive --agree-tos --email ${CERTBOT_EMAIL} -d ${CERTBOT_DOMAIN} --deploy-hook 'cp "$${RENEWED_LINEAGE}/"*.pem /unifi/cert'
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 24h
+    image: certbot/certbot:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: volume
+        source: letsencrypt
+        target: /etc/letsencrypt
+      - type: bind
+        source: /unifi/cert
+        target: /unifi/cert
+
+volumes:
+  letsencrypt:
+    driver: "cloudstor:aws"
+  data:
+    driver: "cloudstor:aws"
+  log:
+    driver: "cloudstor:aws"
+  init.d:
+    driver: "cloudstor:aws"
